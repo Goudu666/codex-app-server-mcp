@@ -99,7 +99,7 @@ codex_wait({ thread_ids: [a, b] })                                 → both repo
 - `codex app-server` is marked **experimental** by OpenAI, so the protocol may change between Codex versions. Tested with codex-cli 0.163.0. To check a new version, regenerate the types with `codex app-server generate-ts --out <dir>`.
 - `files_changed` lists edits made through Codex's patch tool. Edits made via shell commands show up in `recent_commands` instead. Review the actual diff.
 - Each new thread starts the MCP servers from your Codex config, so the first turn may take a few seconds.
-- Long waits: when an MCP call runs for more than about 2 minutes, Claude Code moves it to the background and wakes the session when it returns, so large `wait_seconds` values are fine.
+- The default `wait_seconds` of 240 has worked well in practice; raise it if your MCP client's tool-call timeout allows.
 
 ## Development
 

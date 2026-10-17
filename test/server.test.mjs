@@ -75,6 +75,14 @@ test('approval can change between turns on a loaded thread; sandbox cannot', asy
   await assert.rejects(call('codex_run', { thread_id: r.thread_id, prompt: 'echo x', sandbox: 'read-only' }), /sandbox is fixed/);
 });
 
+test('a stricter approval policy applies to requests that arrive before the turn/start response', async () => {
+  const r = await call('codex_run', { cwd: '/tmp', prompt: 'echo hi', approval: 'never', wait_seconds: 5 });
+  const r2 = await call('codex_run', { thread_id: r.thread_id, prompt: 'approve-early', approval: 'on-request', wait_seconds: 5 });
+  assert.equal(r2.status, 'waitingForInput');
+  assert.equal(r2.pending_requests[0].command, 'curl evil');
+  await call('codex_respond', { request_id: r2.pending_requests[0].request_id, decision: 'decline', wait_seconds: 5 });
+});
+
 test('questions are answered through codex_respond', async () => {
   const r = await call('codex_run', { cwd: '/tmp', prompt: 'ask', wait_seconds: 5 });
   const q = r.pending_requests[0];
@@ -140,10 +148,13 @@ test('worktree: new thread runs in a fresh git worktree + branch', async () => {
 });
 
 // last: kills the fake app-server
-test('app-server crash fails the running turn and the bridge respawns', async () => {
+test('app-server crash fails the running turn, the bridge respawns, threads keep their sandbox', async () => {
+  const ro = await call('codex_run', { cwd: '/tmp', prompt: 'echo ro', sandbox: 'read-only', wait_seconds: 5 });
   const r = await call('codex_run', { cwd: '/tmp', prompt: 'crash', wait_seconds: 5 });
   assert.equal(r.status, 'failed');
   assert.match(r.error, /exited/);
   const again = await call('codex_run', { cwd: '/tmp', prompt: 'echo back', wait_seconds: 5 });
   assert.equal(again.latest_message, 'back');
+  const resumed = await call('codex_run', { thread_id: ro.thread_id, prompt: 'policy', wait_seconds: 5 });
+  assert.equal(resumed.latest_message, 'sandbox=read-only');
 });

@@ -5,6 +5,8 @@
 //   "ask"          ask a question, then echo the answer
 //   "slow"         keep the turn running until steered (finishes with the steer text) or interrupted
 //   "crash"        exit the process mid-turn
+//   "approve-early" like approve, but the request is sent before the turn/start response
+//   "policy"       reply with the sandbox this thread was started/resumed with
 if (process.argv[2] !== 'app-server') process.exit(2);
 
 let buf = '';
@@ -12,6 +14,7 @@ let nextId = 1000;
 let threadSeq = 0;
 const waitingOn = new Map(); // server request id → callback(result)
 const turns = new Map(); // threadId → { id, onSteer }
+const sandboxes = new Map(); // threadId → sandbox from thread/start or thread/resume
 
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const notify = (method, params) => send({ method, params });
@@ -60,6 +63,9 @@ function startTurn(threadId, text) {
         message(threadId, turnId, `steered=${t}`);
         complete(threadId, turnId);
       };
+    } else if (text === 'policy') {
+      message(threadId, turnId, `sandbox=${sandboxes.get(threadId)}`);
+      complete(threadId, turnId);
     } else if (text === 'crash') {
       process.exit(1);
     }
@@ -72,10 +78,25 @@ const handlers = {
   initialize: () => ({ userAgent: 'fake', codexHome: '/tmp', platformFamily: 'unix', platformOs: 'macos' }),
   'thread/start': (p) => {
     const id = `thread_${threadSeq++}`;
+    sandboxes.set(id, p.sandbox);
     return { thread: { id }, cwd: p.cwd, model: 'fake-model', sandbox: p.sandbox, approvalPolicy: p.approvalPolicy };
   },
-  'thread/resume': (p) => ({ thread: { id: p.threadId } }),
-  'turn/start': (p) => ({ turn: turn(startTurn(p.threadId, p.input[0].text)) }),
+  'thread/resume': (p) => {
+    sandboxes.set(p.threadId, p.sandbox);
+    return { thread: { id: p.threadId } };
+  },
+  'turn/start': (p) => {
+    const text = p.input[0].text;
+    if (text !== 'approve-early') return { turn: turn(startTurn(p.threadId, text)) };
+    const turnId = `turn_${itemSeq++}`;
+    turns.set(p.threadId, { id: turnId });
+    ask('item/commandExecution/requestApproval', { threadId: p.threadId, turnId, itemId: 'x', command: 'curl evil', cwd: '/tmp', startedAtMs: 0 }, ({ decision }) => {
+      message(p.threadId, turnId, `decision=${decision}`);
+      complete(p.threadId, turnId);
+    });
+    setImmediate(() => notify('turn/started', { threadId: p.threadId, turn: turn(turnId) }));
+    return { turn: turn(turnId) };
+  },
   'turn/steer': (p) => {
     const t = turns.get(p.threadId);
     if (!t || t.id !== p.expectedTurnId) throw new Error('expectedTurnId mismatch');
