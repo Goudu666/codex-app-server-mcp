@@ -1,0 +1,35 @@
+{
+  "name": "codex-app-server-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets Claude Code (or any MCP client) drive OpenAI Codex through codex app-server: persistent threads, async turns, resume.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "codex",
+    "claude-code",
+    "openai",
+    "app-server",
+    "ai-agents",
+    "multi-agent"
+  ],
+  "author": "Goudu666",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.7"
+  },
+  "bin": {
+    "codex-app-server-mcp": "server.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Goudu666/codex-app-server-mcp.git"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
