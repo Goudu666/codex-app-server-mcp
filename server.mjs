@@ -1,296 +1,149 @@
 #!/usr/bin/env node
-// MCP server that lets Claude drive Codex through `codex app-server` (stdio, newline-delimited JSON).
+// MCP server that lets Claude (or any MCP client) drive Codex through `codex app-server`.
 // stdout belongs to MCP — log only to stderr.
-import { spawn } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { log } from './lib/app-server.mjs';
+import { APPROVAL_POLICIES, Bridge, SANDBOX_MODES } from './lib/bridge.mjs';
 
-const log = (...a) => console.error('[codex-mcp]', ...a);
-const CODEX_BIN = process.env.CODEX_BIN || 'codex';
-const DEFAULT_MODEL = process.env.CODEX_MODEL || undefined;   // undefined → config.toml default
-const DEFAULT_EFFORT = process.env.CODEX_EFFORT || undefined;
-
-// ---------- app-server client ----------
-
-class AppServer {
-  proc = null;
-  nextId = 1;
-  pending = new Map();
-  ready = null;
-
-  constructor(onNotification) {
-    this.onNotification = onNotification;
-  }
-
-  start() {
-    if (this.ready) return this.ready;
-    const proc = spawn(CODEX_BIN, ['app-server'], { stdio: ['pipe', 'pipe', 'pipe'] });
-    this.proc = proc;
-    let buf = '';
-    proc.stdout.on('data', (d) => {
-      buf += d;
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i);
-        buf = buf.slice(i + 1);
-        if (line.trim()) this.handle(JSON.parse(line));
-      }
-    });
-    proc.stderr.on('data', (d) => process.stderr.write(d));
-    proc.on('exit', (code, sig) => {
-      log(`app-server exited code=${code} sig=${sig}; will respawn on next call`);
-      for (const { reject } of this.pending.values()) reject(new Error('codex app-server exited'));
-      this.pending.clear();
-      this.proc = null;
-      this.ready = null;
-      this.onExit?.();
-    });
-    this.ready = this.request('initialize', {
-      clientInfo: { name: 'claude-codex-mcp', title: 'Claude → Codex bridge', version: '0.1.0' },
-      capabilities: null,
-    }).then(() => this.send({ method: 'initialized' }));
-    return this.ready;
-  }
-
-  send(msg) {
-    this.proc.stdin.write(JSON.stringify(msg) + '\n');
-  }
-
-  request(method, params) {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.send({ id, method, params });
-    });
-  }
-
-  async call(method, params) {
-    await this.start();
-    return this.request(method, params);
-  }
-
-  handle(msg) {
-    if (msg.id !== undefined && msg.method === undefined) {
-      const p = this.pending.get(msg.id);
-      if (!p) return;
-      this.pending.delete(msg.id);
-      if (msg.error) p.reject(new Error(`${msg.error.message ?? JSON.stringify(msg.error)}`));
-      else p.resolve(msg.result);
-    } else if (msg.id !== undefined) {
-      this.answerServerRequest(msg);
-    } else {
-      this.onNotification(msg.method, msg.params);
-    }
-  }
-
-  // Codex asking us something. Full access is the intended mode, so approvals are accepted;
-  // anything else gets an error so the turn fails fast instead of hanging.
-  answerServerRequest({ id, method, params }) {
-    log(`server request: ${method}`);
-    const approvals = {
-      'item/commandExecution/requestApproval': { decision: 'accept' },
-      'item/fileChange/requestApproval': { decision: 'accept' },
-      execCommandApproval: { decision: 'approved' },
-      applyPatchApproval: { decision: 'approved' },
-    };
-    if (method in approvals) this.send({ id, result: approvals[method] });
-    else this.send({ id, error: { code: -32601, message: `claude-codex-mcp does not handle ${method}` } });
-  }
-}
-
-// ---------- thread / turn state ----------
-
-// threadId → { cwd, turnId, status, error, items: [{turnId, ...summary}], waiters: Set<fn> }
-const threads = new Map();
-
-function threadState(threadId) {
-  let s = threads.get(threadId);
-  if (!s) {
-    s = { cwd: null, turnId: null, status: 'idle', error: null, items: [], waiters: new Set() };
-    threads.set(threadId, s);
-  }
-  return s;
-}
-
-function summarizeItem(item) {
-  switch (item.type) {
-    case 'agentMessage':
-      return { kind: 'message', text: item.text };
-    case 'commandExecution':
-      return { kind: 'command', command: item.command, exitCode: item.exitCode, status: item.status };
-    case 'fileChange':
-      return { kind: 'files', status: item.status, changes: item.changes.map((c) => ({ path: c.path, type: c.kind.type })) };
-    case 'mcpToolCall':
-      return { kind: 'mcp', tool: `${item.server}.${item.tool}`, status: item.status };
-    case 'webSearch':
-      return { kind: 'webSearch' };
-    default:
-      return null;
-  }
-}
-
-function wake(s) {
-  for (const w of s.waiters) w();
-  s.waiters.clear();
-}
-
-const app = new AppServer((method, p) => {
-  switch (method) {
-    case 'turn/started': {
-      const s = threadState(p.threadId);
-      s.turnId = p.turn.id;
-      s.status = 'inProgress';
-      s.error = null;
-      break;
-    }
-    case 'item/completed': {
-      const sum = summarizeItem(p.item);
-      if (sum) threadState(p.threadId).items.push({ turnId: p.turnId, ...sum });
-      break;
-    }
-    case 'turn/completed': {
-      const s = threadState(p.threadId);
-      s.turnId = p.turn.id;
-      s.status = p.turn.status;
-      s.error = p.turn.error?.message ?? null;
-      wake(s);
-      break;
-    }
-    case 'error':
-      log('error notification:', JSON.stringify(p));
-      break;
-  }
-});
-app.onExit = () => {
-  for (const s of threads.values()) {
-    if (s.status === 'inProgress') {
-      s.status = 'failed';
-      s.error = 'codex app-server exited mid-turn';
-      wake(s);
-    }
-  }
-  threads.clear(); // loaded-thread bookkeeping is per app-server process
+const env = (name, allowed, fallback) => {
+  const v = process.env[name] || fallback;
+  if (!allowed.includes(v)) throw new Error(`${name}=${v} is invalid; expected one of ${allowed.join(', ')}`);
+  return v;
 };
 
-function waitForTurn(s, seconds) {
-  if (s.status !== 'inProgress' || seconds <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
-    const done = () => {
-      clearTimeout(t);
-      s.waiters.delete(done);
-      resolve();
-    };
-    const t = setTimeout(done, seconds * 1000);
-    s.waiters.add(done);
-  });
-}
+const bridge = new Bridge({
+  bin: process.env.CODEX_BIN || 'codex',
+  sandbox: env('CODEX_SANDBOX', SANDBOX_MODES, 'workspace-write'),
+  approval: env('CODEX_APPROVAL', APPROVAL_POLICIES, 'on-request'),
+  model: process.env.CODEX_MODEL || undefined, // undefined → ~/.codex/config.toml default
+  effort: process.env.CODEX_EFFORT || undefined,
+});
 
-function report(threadId) {
-  const s = threads.get(threadId);
-  const items = s.items.filter((i) => i.turnId === s.turnId);
-  const messages = items.filter((i) => i.kind === 'message').map((i) => i.text);
-  const files = new Map();
-  for (const i of items.filter((i) => i.kind === 'files')) for (const c of i.changes) files.set(c.path, c.type);
-  const commands = items.filter((i) => i.kind === 'command');
-  const out = {
-    thread_id: threadId,
-    turn_id: s.turnId,
-    status: s.status,
-    ...(s.error && { error: s.error }),
-    latest_message: messages.at(-1) ?? null,
-    earlier_messages: messages.slice(0, -1),
-    files_changed: [...files].map(([path, type]) => ({ path, type })),
-    commands_run: commands.length,
-    recent_commands: commands.slice(-8).map((c) => ({ command: c.command, exitCode: c.exitCode })),
-    other_tool_calls: items.filter((i) => i.kind === 'mcp').map((i) => i.tool),
-  };
-  if (s.status === 'inProgress') out.hint = 'Turn still running — call codex_wait with this thread_id to keep waiting.';
-  return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
-}
+const json = (v) => ({ content: [{ type: 'text', text: JSON.stringify(v, null, 2) }] });
 
-const SANDBOX = 'danger-full-access';
-const APPROVAL = 'never';
-
-async function ensureThread({ thread_id, cwd }) {
-  if (thread_id) {
-    if (!threads.has(thread_id)) {
-      await app.call('thread/resume', { threadId: thread_id, sandbox: SANDBOX, approvalPolicy: APPROVAL, excludeTurns: true, ...(cwd && { cwd }) });
-      threadState(thread_id);
-    }
-    return thread_id;
+const known = (threadId) => {
+  if (!bridge.threads.has(threadId)) {
+    throw new Error(`thread ${threadId} has no turn in this bridge session — use codex_run with thread_id to continue it`);
   }
-  const res = await app.call('thread/start', {
-    cwd,
-    sandbox: SANDBOX,
-    approvalPolicy: APPROVAL,
-    config: { notify: [] }, // don't fire the desktop app's notifier for bridge-driven turns
-    serviceName: 'claude-codex-mcp',
-  });
-  threadState(res.thread.id).cwd = res.cwd;
-  return res.thread.id;
-}
-
-// ---------- MCP tools ----------
-
-const server = new McpServer({ name: 'codex', version: '0.1.0' });
+};
 
 const waitArg = z.number().int().min(0).max(1800).default(240)
-  .describe('Seconds to block waiting for the turn to finish before returning a progress snapshot (default 240). The turn keeps running after this returns.');
+  .describe('Seconds to block before returning a progress snapshot (default 240). Returns early when the turn finishes or Codex needs an answer. The turn keeps running after this returns.');
+
+const server = new McpServer({ name: 'codex', version: '0.2.0' });
 
 server.registerTool(
   'codex_run',
   {
     title: 'Run a Codex task',
     description:
-      'Give Codex (OpenAI coding agent, full disk access, no approvals) a task. Starts a new thread, or continues an existing one when thread_id is given. ' +
-      'Blocks up to wait_seconds, then returns status + Codex\'s final message, files changed and commands run. ' +
-      'If status is "inProgress", call codex_wait with the same thread_id. Review Codex\'s changes yourself before reporting them as done.',
+      'Give Codex (OpenAI coding agent) a task. Starts a new thread, or continues an existing one when thread_id is given. ' +
+      'Blocks up to wait_seconds, then returns status, Codex\'s latest message, files changed and commands run. ' +
+      'status "inProgress" → codex_wait; "waitingForInput" → answer pending_requests with codex_respond. ' +
+      'Run several threads in parallel by calling codex_run with wait_seconds: 0 for each, then codex_wait with all thread_ids. ' +
+      'Review Codex\'s changes yourself before reporting them as done.',
     inputSchema: {
-      prompt: z.string().describe('Instructions for Codex. Be specific: goal, files, constraints, what "done" looks like.'),
-      cwd: z.string().optional().describe('Absolute working directory. Required when starting a new thread.'),
+      prompt: z.string().min(1).describe('Instructions for Codex. Be specific: goal, files, constraints, what "done" looks like.'),
+      cwd: z.string().optional().describe('Absolute working directory. Required for a new thread.'),
       thread_id: z.string().optional().describe('Continue this existing Codex thread (keeps its context).'),
-      model: z.string().optional().describe('Model override, e.g. "gpt-6-astra". Defaults to Codex config.'),
-      effort: z.string().optional().describe('Reasoning effort override: low | medium | high | xhigh | ultra | max.'),
+      model: z.string().optional().describe('Model override (see codex_models). Defaults to Codex config.'),
+      effort: z.string().optional().describe('Reasoning effort override, e.g. low | medium | high | xhigh (see codex_models).'),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe(`Sandbox for a new (or resumed) thread; fixed after that. Default: ${bridge.defaults.sandbox}.`),
+      approval: z.enum(APPROVAL_POLICIES).optional()
+        .describe(`When Codex must ask before acting; can change between turns. "never" auto-approves everything. Default: ${bridge.defaults.approval}.`),
+      worktree: z.boolean().optional().describe('New thread only: run in a fresh git worktree + branch (codex/<stamp>) of cwd\'s repo, so parallel tasks never collide. The worktree is kept for you to inspect/merge.'),
+      web_search: z.boolean().optional().describe('New thread only: enable live web search for Codex.'),
+      output_schema: z.record(z.string(), z.unknown()).optional().describe('JSON Schema the final message must follow (structured output).'),
       wait_seconds: waitArg,
     },
   },
-  async ({ prompt, cwd, thread_id, model, effort, wait_seconds }) => {
-    if (!thread_id && !cwd) throw new Error('cwd is required when starting a new thread');
-    const threadId = await ensureThread({ thread_id, cwd });
-    const s = threadState(threadId);
-    if (s.status === 'inProgress') throw new Error(`thread ${threadId} already has a running turn; codex_wait or codex_interrupt it first`);
-    model ??= DEFAULT_MODEL;
-    effort ??= DEFAULT_EFFORT;
-    const res = await app.call('turn/start', {
-      threadId,
-      input: [{ type: 'text', text: prompt, text_elements: [] }],
-      ...(model && { model }),
-      ...(effort && { effort }),
-      ...(thread_id && cwd && { cwd }),
-    });
-    // turn/started may already have arrived; only fill in if it hasn't completed meanwhile
-    if (s.turnId !== res.turn.id) {
-      s.turnId = res.turn.id;
-      s.status = res.turn.status;
+  async ({ prompt, cwd, thread_id, model, effort, sandbox, approval, worktree, web_search, output_schema, wait_seconds }) => {
+    let threadId = thread_id;
+    if (threadId) {
+      await bridge.ensureLoaded(threadId, { cwd, sandbox, approval });
+    } else {
+      if (!cwd) throw new Error('cwd is required when starting a new thread');
+      threadId = await bridge.startThread({ cwd, sandbox, approval, worktree, web_search });
     }
-    await waitForTurn(s, wait_seconds);
-    return report(threadId);
+    await bridge.startTurn(threadId, { prompt, model, effort, output_schema, cwd: thread_id && cwd, approval: thread_id && approval });
+    await bridge.wait([threadId], wait_seconds);
+    return json(bridge.report(threadId));
   },
 );
 
 server.registerTool(
   'codex_wait',
   {
-    title: 'Wait for a Codex turn',
-    description: 'Wait (up to wait_seconds) for the current turn on a Codex thread started by codex_run, then return its status and results.',
-    inputSchema: { thread_id: z.string(), wait_seconds: waitArg },
+    title: 'Wait for Codex',
+    description:
+      'Wait for turns on one or more Codex threads, then return their reports. ' +
+      'mode "all" (default) returns when every thread is done or blocked on a request; "any" returns as soon as one is.',
+    inputSchema: {
+      thread_id: z.string().optional(),
+      thread_ids: z.array(z.string()).optional().describe('Several threads (batch wait).'),
+      mode: z.enum(['all', 'any']).default('all'),
+      wait_seconds: waitArg,
+    },
   },
-  async ({ thread_id, wait_seconds }) => {
-    const s = threads.get(thread_id);
-    if (!s) throw new Error(`thread ${thread_id} has no turn in this bridge session; use codex_run with thread_id to continue it`);
-    await waitForTurn(s, wait_seconds);
-    return report(thread_id);
+  async ({ thread_id, thread_ids, mode, wait_seconds }) => {
+    const ids = thread_ids ?? (thread_id ? [thread_id] : []);
+    if (!ids.length) throw new Error('pass thread_id or thread_ids');
+    ids.forEach(known);
+    await bridge.wait(ids, wait_seconds, mode);
+    return json(ids.length === 1 && !thread_ids ? bridge.report(ids[0]) : ids.map((id) => bridge.report(id)));
+  },
+);
+
+server.registerTool(
+  'codex_status',
+  {
+    title: 'Peek at Codex',
+    description: 'Non-blocking snapshot of Codex threads in this session: status, what Codex is doing right now, pending requests.',
+    inputSchema: { thread_ids: z.array(z.string()).optional().describe('Defaults to every thread used in this session.') },
+  },
+  async ({ thread_ids }) => {
+    const ids = thread_ids ?? [...bridge.threads.keys()];
+    ids.forEach(known);
+    return json(ids.map((id) => bridge.report(id)));
+  },
+);
+
+server.registerTool(
+  'codex_respond',
+  {
+    title: 'Answer Codex',
+    description:
+      'Answer a request Codex is blocked on (listed in pending_requests). ' +
+      'Approvals take decision: accept | acceptForSession | decline | cancel. Questions take answers: { <question id>: "answer" }. ' +
+      'Ask the user first when the request is something they should decide.',
+    inputSchema: {
+      request_id: z.string(),
+      decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']).optional(),
+      answers: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional(),
+      wait_seconds: waitArg,
+    },
+  },
+  async ({ request_id, decision, answers, wait_seconds }) => {
+    const threadId = await bridge.respond(request_id, { decision, answers });
+    await bridge.wait([threadId], wait_seconds);
+    return json(bridge.report(threadId));
+  },
+);
+
+server.registerTool(
+  'codex_steer',
+  {
+    title: 'Steer a running Codex turn',
+    description: 'Add instructions to the turn Codex is currently working on, without stopping it.',
+    inputSchema: { thread_id: z.string(), prompt: z.string().min(1), wait_seconds: waitArg },
+  },
+  async ({ thread_id, prompt, wait_seconds }) => {
+    known(thread_id);
+    await bridge.steer(thread_id, prompt);
+    await bridge.wait([thread_id], wait_seconds);
+    return json(bridge.report(thread_id));
   },
 );
 
@@ -302,38 +155,75 @@ server.registerTool(
     inputSchema: { thread_id: z.string() },
   },
   async ({ thread_id }) => {
-    const s = threads.get(thread_id);
-    if (!s || s.status !== 'inProgress') throw new Error(`thread ${thread_id} has no running turn`);
-    await app.call('turn/interrupt', { threadId: thread_id, turnId: s.turnId });
-    await waitForTurn(s, 30);
-    return report(thread_id);
+    known(thread_id);
+    await bridge.interrupt(thread_id);
+    await bridge.wait([thread_id], 30);
+    return json(bridge.report(thread_id));
   },
+);
+
+server.registerTool(
+  'codex_review',
+  {
+    title: 'Codex code review',
+    description:
+      'Run Codex\'s native code review (read-only) in a git repo. The review text comes back in the "review" field. ' +
+      'Pass focus and/or adversarial: true for a steerable review that challenges the design, not just bugs.',
+    inputSchema: {
+      cwd: z.string().describe('Absolute path inside the git repository.'),
+      target: z.enum(['uncommitted', 'base', 'commit']).default('uncommitted')
+        .describe('uncommitted changes, the branch vs base_branch, or one commit_sha.'),
+      base_branch: z.string().optional(),
+      commit_sha: z.string().optional(),
+      focus: z.string().optional().describe('What to concentrate on, e.g. "concurrency and error handling".'),
+      adversarial: z.boolean().optional().describe('Challenge the approach and assumptions, not just find bugs.'),
+      model: z.string().optional(),
+      effort: z.string().optional(),
+      wait_seconds: waitArg,
+    },
+  },
+  async ({ wait_seconds, ...args }) => {
+    const threadId = await bridge.review(args);
+    await bridge.wait([threadId], wait_seconds);
+    return json(bridge.report(threadId));
+  },
+);
+
+server.registerTool(
+  'codex_compact',
+  {
+    title: 'Compact a Codex thread',
+    description: 'Summarize a long Codex thread\'s history to free up its context window. Runs in the background.',
+    inputSchema: { thread_id: z.string() },
+  },
+  async ({ thread_id }) => {
+    await bridge.compact(thread_id);
+    return json({ thread_id, compaction: 'started' });
+  },
+);
+
+server.registerTool(
+  'codex_models',
+  {
+    title: 'List Codex models',
+    description: 'Models available to this Codex login, with supported reasoning efforts.',
+    inputSchema: { include_hidden: z.boolean().optional() },
+  },
+  async ({ include_hidden }) => json(await bridge.models(include_hidden)),
 );
 
 server.registerTool(
   'codex_threads',
   {
     title: 'List Codex threads',
-    description: 'List recent Codex threads (including ones from the Codex app/CLI), newest first. Use a thread id with codex_run to continue it.',
+    description: 'List recent Codex threads (including ones from the Codex app/CLI), newest first. Continue one with codex_run + thread_id.',
     inputSchema: {
       cwd: z.string().optional().describe('Only threads with exactly this working directory.'),
       limit: z.number().int().min(1).max(50).default(10),
     },
   },
-  async ({ cwd, limit }) => {
-    const res = await app.call('thread/list', { limit, ...(cwd && { cwd }), useStateDbOnly: true });
-    const rows = res.data.map((t) => ({
-      thread_id: t.id,
-      name: t.name,
-      preview: t.preview?.slice(0, 160),
-      cwd: t.cwd,
-      model: t.model,
-      updatedAt: t.updatedAt && new Date(t.updatedAt * 1000).toISOString(),
-      running_here: threads.get(t.id)?.status === 'inProgress',
-    }));
-    return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
-  },
+  async (args) => json(await bridge.listThreads(args)),
 );
 
 await server.connect(new StdioServerTransport());
-log('ready');
+log(`ready (sandbox=${bridge.defaults.sandbox}, approval=${bridge.defaults.approval})`);
