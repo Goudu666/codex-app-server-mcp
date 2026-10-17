@@ -55,12 +55,14 @@ Every task tool returns the same report:
 Requires Node ≥ 20 and the Codex CLI (`npm i -g @openai/codex`, logged in).
 
 ```bash
-git clone https://github.com/Goudu666/codex-app-server-mcp.git
-cd codex-app-server-mcp && npm install
-claude mcp add --scope user codex -e CODEX_BIN="$(which codex)" -- "$(which node)" "$PWD/server.mjs"
+claude mcp add --scope user codex -- npx -y codex-app-server-mcp
 ```
 
-Then start a new Claude Code session and say something like *"Have Codex implement X in this repo, then review its diff."* Any other MCP client works too: run `node server.mjs` over stdio.
+Then start a new Claude Code session and say something like *"Have Codex implement X in this repo, then review its diff."*
+
+Any other MCP client: use the command `npx -y codex-app-server-mcp` (stdio). If the client can't find `codex` on its `PATH` (common with nvm), add `-e CODEX_BIN="$(which codex)"`.
+
+From source: `git clone https://github.com/Goudu666/codex-app-server-mcp.git && cd codex-app-server-mcp && npm install`, then point your client at `node server.mjs`.
 
 ### Configuration
 
@@ -79,7 +81,7 @@ By default Codex can write inside the working directory and **asks before** anyt
 Full autonomy, where Codex can touch anything your user can and never asks:
 
 ```bash
-claude mcp add --scope user codex -e CODEX_SANDBOX=danger-full-access -e CODEX_APPROVAL=never -e CODEX_BIN="$(which codex)" -- "$(which node)" "$PWD/server.mjs"
+claude mcp add --scope user codex -e CODEX_SANDBOX=danger-full-access -e CODEX_APPROVAL=never -- npx -y codex-app-server-mcp
 ```
 
 or per task: `codex_run({ ..., sandbox: "danger-full-access", approval: "never" })`. The sandbox is fixed once a thread starts; the approval policy can change between turns. MCP servers inside Codex that request a form (elicitation) are auto-declined.
@@ -126,7 +128,7 @@ node test/resume.mjs <thread_id>           # continue an existing thread from a 
 
 **权限默认值**：`workspace-write` + `on-request`。Codex 只能写工作目录，超出范围要先问，问题会交给 Claude 回答。想完全放开就设 `CODEX_SANDBOX=danger-full-access` 和 `CODEX_APPROVAL=never`，具体见上面的 Permissions 一节。
 
-安装、工具列表和配置项见上文。`codex app-server` 目前是 experimental，Codex 升级后协议可能会变。
+安装只要一行：`claude mcp add --scope user codex -- npx -y codex-app-server-mcp`。工具列表和配置项见上文。`codex app-server` 目前是 experimental，Codex 升级后协议可能会变。
 
 ## License
 
