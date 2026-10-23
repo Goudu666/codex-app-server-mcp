@@ -11,6 +11,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const path = (p) => fileURLToPath(new URL(p, import.meta.url));
 let client;
+const worktreeRoot = mkdtempSync(join(tmpdir(), 'codex-mcp-worktrees-'));
 
 before(async () => {
   client = new Client({ name: 'test', version: '0' });
@@ -18,7 +19,7 @@ before(async () => {
     new StdioClientTransport({
       command: process.execPath,
       args: [path('../server.mjs')],
-      env: { ...process.env, CODEX_BIN: path('./fake-codex.mjs'), CODEX_SANDBOX: 'workspace-write', CODEX_APPROVAL: 'on-request' },
+      env: { ...process.env, CODEX_BIN: path('./fake-codex.mjs'), CODEX_SANDBOX: 'workspace-write', CODEX_APPROVAL: 'on-request', CODEX_WORKTREE_ROOT: worktreeRoot },
       stderr: 'ignore',
     }),
   );
@@ -72,7 +73,7 @@ test('approval can change between turns on a loaded thread; sandbox cannot', asy
   const r2 = await call('codex_run', { thread_id: r.thread_id, prompt: 'approve', approval: 'on-request', wait_seconds: 5 });
   assert.equal(r2.status, 'waitingForInput');
   await call('codex_respond', { request_id: r2.pending_requests[0].request_id, decision: 'cancel', wait_seconds: 5 });
-  await assert.rejects(call('codex_run', { thread_id: r.thread_id, prompt: 'echo x', sandbox: 'read-only' }), /sandbox is fixed/);
+  await assert.rejects(call('codex_run', { thread_id: r.thread_id, prompt: 'echo x', sandbox: 'read-only' }), /fixed per thread/);
 });
 
 test('a stricter approval policy applies to requests that arrive before the turn/start response', async () => {
@@ -116,11 +117,18 @@ test('interrupt and batch wait', async () => {
 
 test('review: native target, and focus/adversarial become custom instructions', async () => {
   const plain = await call('codex_review', { cwd: '/tmp', target: 'base', base_branch: 'main', wait_seconds: 5 });
-  assert.equal(plain.review, 'REVIEW {"type":"baseBranch","branch":"main"}');
+  assert.equal(plain.review, 'REVIEW sandbox=read-only {"type":"baseBranch","branch":"main"}');
   const adv = await call('codex_review', { cwd: '/tmp', adversarial: true, focus: 'error handling', wait_seconds: 5 });
   assert.match(adv.review, /"type":"custom"/);
   assert.match(adv.review, /uncommitted changes.*skeptical.*Focus on: error handling/);
   await assert.rejects(call('codex_review', { cwd: '/tmp', target: 'commit' }), /commit_sha/);
+});
+
+test('a per-thread permission profile replaces the sandbox and stays fixed', async () => {
+  const r = await call('codex_run', { cwd: '/tmp', prompt: 'policy', permissions: ':workspace', wait_seconds: 5 });
+  assert.equal(r.latest_message, 'permissions=:workspace');
+  await assert.rejects(call('codex_run', { thread_id: r.thread_id, prompt: 'echo x', permissions: ':read-only' }), /fixed per thread/);
+  await assert.rejects(call('codex_run', { cwd: '/tmp', prompt: 'echo x', sandbox: 'read-only', permissions: ':workspace' }), /not both/);
 });
 
 test('models, threads, compact', async () => {
@@ -141,6 +149,7 @@ test('worktree: new thread runs in a fresh git worktree + branch', async () => {
   try {
     assert.match(r.worktree.branch, /^codex\//);
     assert.ok(existsSync(r.worktree.path));
+    assert.ok(r.worktree.path.startsWith(worktreeRoot + '/'));
     assert.match(git('worktree', 'list'), new RegExp(r.worktree.branch.replace('/', '\\/')));
   } finally {
     git('worktree', 'remove', '--force', r.worktree.path);

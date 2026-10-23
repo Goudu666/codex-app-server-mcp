@@ -69,10 +69,12 @@ From source: `git clone https://github.com/Goudu666/codex-app-server-mcp.git && 
 | Env var | Default | |
 |---|---|---|
 | `CODEX_SANDBOX` | `workspace-write` | Default sandbox for new threads: `read-only`, `workspace-write`, `danger-full-access` |
+| `CODEX_PERMISSIONS` | unset | Default named permission profile for new threads (for example `:workspace` or a profile from your Codex config), sent instead of a sandbox. Cannot be combined with `CODEX_SANDBOX`. |
 | `CODEX_APPROVAL` | `on-request` | Default approval policy: `untrusted`, `on-request`, `never` |
 | `CODEX_MODEL` | from `~/.codex/config.toml` | Default model |
 | `CODEX_EFFORT` | from `~/.codex/config.toml` | Default reasoning effort |
 | `CODEX_BIN` | `codex` | Path to the Codex CLI |
+| `CODEX_WORKTREE_ROOT` | `~/.codex-mcp/worktrees` | Where `worktree: true` creates worktrees |
 
 ## Permissions
 
@@ -86,6 +88,8 @@ claude mcp add --scope user codex -e CODEX_SANDBOX=danger-full-access -e CODEX_A
 
 or per task: `codex_run({ ..., sandbox: "danger-full-access", approval: "never" })`. The sandbox is fixed once a thread starts; the approval policy can change between turns. MCP servers inside Codex that request a form (elicitation) are auto-declined.
 
+Codex permission profiles work too: set `CODEX_PERMISSIONS` (or pass `permissions` to `codex_run`) to send a named profile instead of a sandbox mode. Use this when your Codex config or managed requirements define `default_permissions` or restrict `allowed_permission_profiles`, since Codex rejects a sandbox mode combined with a profile. Like the sandbox, the profile is fixed once a thread starts. With a profile default, `codex_review` uses the built-in `:read-only` profile.
+
 ## Parallel work
 
 ```text
@@ -94,7 +98,7 @@ codex_run({ cwd, prompt: "B", worktree: true, wait_seconds: 0 })  → thread b
 codex_wait({ thread_ids: [a, b] })                                 → both reports
 ```
 
-`worktree: true` creates `~/.codex-mcp/worktrees/<repo>-<stamp>` on a new branch `codex/<stamp>`. Worktrees are kept for you to inspect and merge. Remove them with `git worktree remove <path>`.
+`worktree: true` creates `<CODEX_WORKTREE_ROOT>/<repo>-<stamp>` (default `~/.codex-mcp/worktrees`) on a new branch `codex/<stamp>`. Worktrees are kept for you to inspect and merge. Remove them with `git worktree remove <path>`.
 
 ## Notes
 

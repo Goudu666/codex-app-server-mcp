@@ -13,10 +13,16 @@ const env = (name, allowed, fallback) => {
   return v;
 };
 
+if (process.env.CODEX_SANDBOX && process.env.CODEX_PERMISSIONS) {
+  throw new Error('set CODEX_SANDBOX or CODEX_PERMISSIONS, not both');
+}
+
 const bridge = new Bridge({
   bin: process.env.CODEX_BIN || 'codex',
   sandbox: env('CODEX_SANDBOX', SANDBOX_MODES, 'workspace-write'),
+  permissions: process.env.CODEX_PERMISSIONS || undefined, // named permission profile; replaces the sandbox default
   approval: env('CODEX_APPROVAL', APPROVAL_POLICIES, 'on-request'),
+  worktreeRoot: process.env.CODEX_WORKTREE_ROOT || undefined,
   model: process.env.CODEX_MODEL || undefined, // undefined → ~/.codex/config.toml default
   effort: process.env.CODEX_EFFORT || undefined,
 });
@@ -31,6 +37,8 @@ const known = (threadId) => {
 
 const waitArg = z.number().int().min(0).max(1800).default(240)
   .describe('Seconds to block before returning a progress snapshot (default 240). Returns early when the turn finishes or Codex needs an answer. The turn keeps running after this returns.');
+
+const defaultPolicy = bridge.defaults.permissions ? `permissions ${bridge.defaults.permissions}` : `sandbox ${bridge.defaults.sandbox}`;
 
 const server = new McpServer({ name: 'codex', version: '0.2.0' });
 
@@ -50,7 +58,9 @@ server.registerTool(
       thread_id: z.string().optional().describe('Continue this existing Codex thread (keeps its context).'),
       model: z.string().optional().describe('Model override (see codex_models). Defaults to Codex config.'),
       effort: z.string().optional().describe('Reasoning effort override, e.g. low | medium | high | xhigh (see codex_models).'),
-      sandbox: z.enum(SANDBOX_MODES).optional().describe(`Sandbox for a new (or resumed) thread; fixed after that. Default: ${bridge.defaults.sandbox}.`),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe(`Sandbox for a new (or resumed) thread; fixed after that. Cannot be combined with permissions. Default: ${defaultPolicy}.`),
+      permissions: z.string().optional()
+        .describe(`Named permission profile (e.g. ":read-only", ":workspace", or one from Codex config) for a new (or resumed) thread; fixed after that. Cannot be combined with sandbox. Default: ${defaultPolicy}.`),
       approval: z.enum(APPROVAL_POLICIES).optional()
         .describe(`When Codex must ask before acting; can change between turns. "never" auto-approves everything. Default: ${bridge.defaults.approval}.`),
       worktree: z.boolean().optional().describe('New thread only: run in a fresh git worktree + branch (codex/<stamp>) of cwd\'s repo, so parallel tasks never collide. The worktree is kept for you to inspect/merge.'),
@@ -59,13 +69,13 @@ server.registerTool(
       wait_seconds: waitArg,
     },
   },
-  async ({ prompt, cwd, thread_id, model, effort, sandbox, approval, worktree, web_search, output_schema, wait_seconds }) => {
+  async ({ prompt, cwd, thread_id, model, effort, sandbox, permissions, approval, worktree, web_search, output_schema, wait_seconds }) => {
     let threadId = thread_id;
     if (threadId) {
-      await bridge.ensureLoaded(threadId, { cwd, sandbox, approval });
+      await bridge.ensureLoaded(threadId, { cwd, sandbox, permissions, approval });
     } else {
       if (!cwd) throw new Error('cwd is required when starting a new thread');
-      threadId = await bridge.startThread({ cwd, sandbox, approval, worktree, web_search });
+      threadId = await bridge.startThread({ cwd, sandbox, permissions, approval, worktree, web_search });
     }
     await bridge.startTurn(threadId, { prompt, model, effort, output_schema, cwd: thread_id && cwd, approval: thread_id && approval });
     await bridge.wait([threadId], wait_seconds);
@@ -226,4 +236,4 @@ server.registerTool(
 );
 
 await server.connect(new StdioServerTransport());
-log(`ready (sandbox=${bridge.defaults.sandbox}, approval=${bridge.defaults.approval})`);
+log(`ready (${defaultPolicy}, approval=${bridge.defaults.approval})`);
