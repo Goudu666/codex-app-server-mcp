@@ -5,7 +5,7 @@
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/server.test.mjs test/permissions.test.mjs"
+    "test": "node --test test/server.test.mjs test/permissions.test.mjs test/spawn-failure.test.mjs"
   },
   "keywords": [
     "mcp",
